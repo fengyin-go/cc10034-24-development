@@ -1,8 +1,8 @@
 """检查点管理领域服务：管理CDC采集的位点检查点提交和回退。
 
 上游：cdc_channel 启动后记录检查点
-消费：position_store 消费检查点更新位点记录
-下游：failover_group 消费检查点判定是否需要故障切换
+消费：position_store 消费检查点更新位点记录；主备配对登记确认
+下游：failover_group 通过恢复位置包判定是否满足切换条件
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any
 
 from app.services.base import BaseModuleService
 from app.pipeline import CheckpointRecord, PositionSnapshot, pipeline_bus
+from app.services.recovery_position import recovery_registry
 
 
 class CheckpointManagerService(BaseModuleService):
@@ -24,6 +25,66 @@ class CheckpointManagerService(BaseModuleService):
     STATUS_ORDER = ["已记录", "已提交", "已过期", "已回退"]
     ACTION_RULES = {"提交检查点": "已记录", "回退检查点": "已记录", "标记过期": "已提交"}
     NEGATIVE_ACTIONS = []
+
+    def register_pair_confirmation(
+        self, values: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, list[str], str]:
+        """登记主端 / 备用端检查点确认；两端到齐且可比时自动生成恢复位置包。"""
+        return recovery_registry.register_confirmation(values)
+
+    def pair_status(self, group: str | None = None) -> dict[str, Any]:
+        """当前主备配对与恢复位置包状态。"""
+        with recovery_registry.lock:
+            confirmations = [
+                row.to_dict() for row in recovery_registry._confirmations(group)
+            ]
+            packages = [
+                package.to_dict() for package in recovery_registry._packages(group)
+            ]
+            latest = packages[-1] if packages else None
+            pending: dict[str, list[str]] = {}
+            for row in recovery_registry._confirmations(group):
+                missing = recovery_registry._pending_roles_locked(
+                    row.group_name, row.generation
+                )
+                if missing:
+                    pending[f"{row.group_name}#代次{row.generation}"] = missing
+            return {
+                "group": group,
+                "confirmation_count": len(confirmations),
+                "confirmations": confirmations,
+                "package_count": len(packages),
+                "packages": packages,
+                "latest_package_version": (
+                    latest["package_version"] if latest else None
+                ),
+                "latest_continuation_start": (
+                    latest["continuation_start"] if latest else None
+                ),
+                "pending_generations": pending,
+            }
+
+    def resolve_recovery_package(
+        self,
+        group: str,
+        generation: int | None = None,
+        strict: bool = False,
+    ) -> dict[str, Any]:
+        """下载时解析要交给演练的恢复位置包（只取已确认的完整配对）。"""
+        return recovery_registry.resolve_delivery(group, generation, strict=strict)
+
+    def lookup_checkpoint_package(self, entry_id: int) -> dict[str, Any] | None:
+        """按检查点记录反查它所属的恢复位置包版本和接续起点。"""
+        return recovery_registry.lookup_checkpoint(entry_id)
+
+    def list_handoffs(self, group: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """下载交接记录：哪笔下载把哪个包版本交给了哪次演练。"""
+        handoffs = recovery_registry.list_handoffs(group, limit)
+        return {
+            "group": group,
+            "count": len(handoffs),
+            "items": handoffs,
+        }
 
     def create_checkpoint(self, channel_name: str, binlog_file: str, offset: int,
                           data_payload: dict[str, Any] | None = None) -> CheckpointRecord:
@@ -147,3 +208,24 @@ class CheckpointManagerService(BaseModuleService):
             cid = entry.get("检查点ID", "")
             self.rollback_to_checkpoint(cid)
         return entry, msg
+
+    def list_entries(self, **kwargs: Any):
+        """列表记录带上所属恢复位置包版本和接续起点，供值班员直接查看。"""
+        rows, total = super().list_entries(**kwargs)
+        return [self._decorate(dict(row)) for row in rows], total
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        row = super().get_entry(entry_id)
+        return self._decorate(dict(row)) if row is not None else None
+
+    def _decorate(self, row: dict[str, Any]) -> dict[str, Any]:
+        checkpoint_id = str(row.get("检查点ID") or "")
+        link = (
+            recovery_registry.checkpoint_links.get(checkpoint_id)
+            if checkpoint_id
+            else None
+        )
+        if link is not None and not row.get("恢复包版本"):
+            row["恢复包版本"] = f"v{link['package_version']}"
+            row["接续起点"] = link["continuation_start"]
+        return row

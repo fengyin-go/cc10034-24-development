@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -65,6 +67,74 @@ class CheckpointRecord:
     data_checksum: str
 
 
+@dataclass
+class CheckpointConfirmation:
+    """主端 / 备用端各自的位点确认。
+
+    只有同一代次（generation）、同一 Binlog 文件的主备确认才可以配成
+    恢复位置包；代次不同的确认即使时间相邻也不能混装。
+    """
+    confirmation_id: str
+    group_name: str
+    role: str  # primary / standby
+    channel_name: str
+    checkpoint_id: str
+    binlog_file: str
+    offset: int
+    generation: int
+    confirmed_at: datetime
+    data_checksum: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "confirmation_id": self.confirmation_id,
+            "group_name": self.group_name,
+            "role": self.role,
+            "channel_name": self.channel_name,
+            "checkpoint_id": self.checkpoint_id,
+            "binlog_file": self.binlog_file,
+            "offset": self.offset,
+            "generation": self.generation,
+            "confirmed_at": self.confirmed_at.isoformat(),
+            "data_checksum": self.data_checksum,
+        }
+
+
+@dataclass
+class RecoveryPositionPackage:
+    """已确认的主备恢复位置包。
+
+    包一旦生成即不可变：同一包版本重复下载必须返回完全相同的文件内容，
+    后续确认只能形成新的代次 / 新版本，不能回写旧包。
+    """
+    package_version: int
+    package_id: str
+    group_name: str
+    generation: int
+    primary: dict[str, Any]
+    standby: dict[str, Any]
+    continuation_start: str
+    replay_range: dict[str, Any]
+    created_at: str
+    checksum: str
+    payload_json: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.payload_json) if self.payload_json else {
+            "package_version": self.package_version,
+            "package_id": self.package_id,
+            "group_name": self.group_name,
+            "generation": self.generation,
+            "primary": dict(self.primary),
+            "standby": dict(self.standby),
+            "continuation_start": self.continuation_start,
+            "replay_range": dict(self.replay_range),
+            "created_at": self.created_at,
+            "checksum": self.checksum,
+        }
+
+
+
 class PipelineBus:
     """管道级事件总线：持有事件队列、Schema 注册表、位点注册表、SCD 状态存储。
 
@@ -80,6 +150,15 @@ class PipelineBus:
         # 位点注册 — checkpoint_manager/position_store 写入，cdc_channel/failover_group 消费
         self.positions: dict[str, PositionSnapshot] = {}
         self.checkpoints: list[CheckpointRecord] = []
+        # 主备配对确认 — checkpoint_manager 登记，failover_group 演练消费
+        # 只有同一代次、同一 Binlog 文件的主备确认才能配成恢复位置包。
+        self.confirmations: list[CheckpointConfirmation] = []
+        # 恢复位置包 — 生成后不可变，按 group + generation 幂等复用
+        self.recovery_packages: list[RecoveryPositionPackage] = []
+        # 并发生成 / 登记时的互斥锁：同一时刻只允许一个请求读取完整配对并出包
+        self.pairing_lock = threading.RLock()
+        # 下载交接记录：下载请求把哪个包版本交给了哪次演练
+        self.package_handoffs: list[dict[str, Any]] = []
         # Schema 注册 — schema_sync 写入，ddl_tracker/format_adapter 消费
         self.schema_registry: dict[str, list[dict[str, Any]]] = {}
         # SCD 状态 — scd_handler 核心存储
@@ -328,6 +407,9 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "confirmation_count": len(self.confirmations),
+            "recovery_package_count": len(self.recovery_packages),
+            "package_handoff_count": len(self.package_handoffs),
         }
 
 

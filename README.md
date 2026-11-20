@@ -77,5 +77,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 检查点主备配对 / 恢复位置包
+
+值班员需要一份能直接交给切换演练的主备配对文件。流程是：主端、备用端各自
+登记检查点确认 → 同一组、同一代次、同一 Binlog 文件的完整配对固化成
+**恢复位置包** → 下载给演练 → 演练用包核对启动条件 → 结果回写切换清单。
+
+相关接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/checkpoint_manager/confirmations` | 登记主端 / 备用端确认（两端到齐自动出包） |
+| GET | `/api/checkpoint_manager/pairing?group=` | 配对状态、包列表、未配齐代次 |
+| GET | `/api/checkpoint_manager/recovery-package/download?group=&generation=&strict=` | 下载恢复位置包 |
+| GET | `/api/checkpoint_manager/recovery-package/handoffs?group=` | 下载交接记录 |
+| GET | `/api/checkpoint_manager/{id}/recovery-package` | 检查点反查包版本与接续起点 |
+| POST | `/api/failover_group/{id}/drill` | 切换演练（可传 `交接ID` / `代次` / `严格`） |
+
+关键约束（`backend/app/services/recovery_position.py`）：
+
+- **只接收已确认的完整配对**：一端确认、另一端未到时不产生新包。
+- **可比代次**：包内两个位置必须同代次、同 Binlog 文件，且备用端位点不超前。
+- **下载不拼半成品**：请求代次未配齐时沿用该组上一份已确认配对，并在响应头
+  `X-Recovery-Resolution`、`X-Recovery-Pending-Roles` 标注；`strict=true` 直接 409。
+- **同版幂等**：同一包版本重复下载返回完全相同的文件内容（payload 出包时固化）。
+- **并发安全**：登记、配对、出包、交接在同一把 `pairing_lock` 内完成。
+- **演练回写**：包版本、接续起点、重放范围写回切换清单，并可在检查点记录反查。
+
+
 领域：数据工程
 子方向：数仓与数据湖
